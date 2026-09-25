@@ -1,0 +1,6 @@
+{
+  "name": "NutriSG - MCP Health & Nutrition Advisor",
+  "description": "Singapore-focused health, nutrition, and wellness meal recommendation engine powered by Model Context Protocol (MCP) data sources including SG FoodID, USDA FoodData Central, PubMed evidence, and Garmin fitness.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
