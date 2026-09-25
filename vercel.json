@@ -1,3 +1,7 @@
 {
-  "rewrites": [{ "source": "/api/:path*", "destination": "/api" }]
+  "installCommand": "npm install --no-package-lock",
+  "buildCommand": "npm run build",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api" }
+  ]
 }
