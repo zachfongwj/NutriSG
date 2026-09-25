@@ -1,6 +1,6 @@
 {
-  "installCommand": "bun install",
-  "buildCommand": "bun run build",
+  "installCommand": "npm install --no-package-lock",
+  "buildCommand": "npm run build",
   "functions": {
     "api/**/*.ts": {
       "runtime": "@vercel/node@5.3.0"
