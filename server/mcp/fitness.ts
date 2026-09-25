@@ -1,57 +1,7 @@
 import { MCPClient } from './client';
 import { GarminActivityRaw } from '../types/activity';
 import { MCPCallLog } from '../types/orchestration';
-
 export class GarminFitnessMCPClient {
-  private mcpClient: MCPClient;
-
-  constructor(client: MCPClient) {
-    this.mcpClient = client;
-  }
-
-  private findTool(candidates: string[]): string | undefined {
-    const discovered = this.mcpClient.getDiscoveredTools().map(t => t.name);
-    return candidates.find(c => discovered.includes(c));
-  }
-
-  public async getDailyActivity(
-    date?: string
-  ): Promise<{ data?: any; log?: MCPCallLog; error?: string }> {
-    const tool = this.findTool(['garmin_get_daily_activity', 'get_daily_activity']) || 'garmin_get_daily_activity';
-    const res = await this.mcpClient.invokeTool<any>(tool, { date });
-    return { data: res.result, log: res.log, error: res.error };
-  }
-
-  public async getActivities(
-    limit = 3
-  ): Promise<{ activities: GarminActivityRaw[]; log?: MCPCallLog; error?: string }> {
-    const tool = this.findTool(['garmin_get_activities', 'get_activities']) || 'garmin_get_activities';
-    const res = await this.mcpClient.invokeTool<any>(tool, { limit });
-
-    if (!res.success || !res.result) {
-      return { activities: [], log: res.log, error: res.error };
-    }
-
-    const rawActivities = res.result.activities || [];
-    const normalized: GarminActivityRaw[] = rawActivities.map((a: any) => ({
-      activityId: a.activityId,
-      activityType: a.activityType || 'Activity',
-      startTime: a.startTime || '18:00',
-      durationMinutes: Number(a.durationMinutes) || 30,
-      intensity: a.intensity || 'moderate',
-      estimatedCaloriesBurned: Number(a.estimatedCaloriesBurned) || 250,
-      averageHeartRate: a.averageHeartRate ? Number(a.averageHeartRate) : undefined,
-      source: 'Garmin'
-    }));
-
-    return { activities: normalized, log: res.log };
-  }
-
-  public async getActivityMetrics(
-    activityId: string
-  ): Promise<{ metrics?: any; log?: MCPCallLog; error?: string }> {
-    const tool = this.findTool(['garmin_get_activity_metrics', 'get_activity_metrics']) || 'garmin_get_activity_metrics';
-    const res = await this.mcpClient.invokeTool<any>(tool, { activityId });
-    return { metrics: res.result, log: res.log, error: res.error };
-  }
+  constructor(private readonly mcpClient: MCPClient) {}
+  async getActivities(limit = 3): Promise<{ activities: GarminActivityRaw[]; log?: MCPCallLog; error?: string }> { const tool = this.mcpClient.getDiscoveredTools().map(t => t.name).find(name => /garmin|activity.*(list|search)|get.*activit/i.test(name)); if (!tool) return { activities: [], error: 'Garmin MCP has no discovered activity tool' }; const result = await this.mcpClient.invokeTool<any>(tool, { limit }); if (!result.success) return { activities: [], log: result.log, error: result.error }; const raw = Array.isArray(result.result) ? result.result : result.result?.activities || result.result?.data || []; return { activities: raw.map((a: any) => ({ activityId: a.activityId || a.id, activityType: String(a.activityType || a.type || 'Activity'), startTime: String(a.startTime || a.start_time || ''), durationMinutes: Number(a.durationMinutes ?? a.duration_minutes), intensity: a.intensity || 'moderate', estimatedCaloriesBurned: Number(a.estimatedCaloriesBurned ?? a.calories), averageHeartRate: a.averageHeartRate ? Number(a.averageHeartRate) : undefined, source: 'Garmin' as const })).filter((a: GarminActivityRaw) => a.startTime && Number.isFinite(a.durationMinutes) && Number.isFinite(a.estimatedCaloriesBurned)), log: result.log }; }
 }

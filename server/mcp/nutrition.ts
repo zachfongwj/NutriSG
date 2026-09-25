@@ -3,138 +3,25 @@ import { FoodItem } from '../types/food';
 import { MCPCallLog } from '../types/orchestration';
 
 export class USDANutritionMCPClient {
-  private mcpClient: MCPClient;
-
-  constructor(client: MCPClient) {
-    this.mcpClient = client;
+  constructor(private readonly mcpClient: MCPClient) {}
+  private findTool(candidates: string[]) { return candidates.find(name => this.mcpClient.getDiscoveredTools().some(tool => tool.name === name)); }
+  async searchFoods(query: string, limit = 5): Promise<{ foods: FoodItem[]; log?: MCPCallLog; error?: string }> {
+    const tool = this.findTool(['search_foods', 'food_search', 'usda_search_foods', 'searchFoods']);
+    if (!tool) return { foods: [], error: 'Food MCP has no discovered search tool' };
+    const result = await this.mcpClient.invokeTool<any>(tool, { query, pageSize: limit, limit });
+    if (!result.success) return { foods: [], log: result.log, error: result.error };
+    const raw = Array.isArray(result.result) ? result.result : result.result?.foods || result.result?.data || [];
+    return { foods: raw.map((item: any) => this.normalize(item)).filter(Boolean) as FoodItem[], log: result.log };
   }
-
-  /**
-   * Discovers tools and identifies the tool for food search
-   */
-  private findTool(candidates: string[]): string | undefined {
-    const discovered = this.mcpClient.getDiscoveredTools().map(t => t.name);
-    return candidates.find(c => discovered.includes(c));
-  }
-
-  /**
-   * Search foods via USDA MCP with tool discovery
-   */
-  public async searchFoods(
-    query: string,
-    limit = 5
-  ): Promise<{ foods: FoodItem[]; log?: MCPCallLog; error?: string }> {
-    // Check discovered tools dynamically
-    const searchTool = this.findTool(['usda_search_foods', 'search_foods', 'searchFoods']) || 'usda_search_foods';
-
-    const invokeRes = await this.mcpClient.invokeTool<any>(searchTool, {
-      query,
-      pageSize: limit
-    });
-
-    if (!invokeRes.success || !invokeRes.result) {
-      return { foods: [], log: invokeRes.log, error: invokeRes.error || 'Failed to search foods' };
-    }
-
-    const rawFoods = invokeRes.result.foods || [];
-    const normalized: FoodItem[] = rawFoods.map((f: any) => this.normalizeUSDAFood(f));
-
-    return { foods: normalized, log: invokeRes.log };
-  }
-
-  /**
-   * Retrieve food by FDC ID via USDA MCP
-   */
-  public async getFood(
-    fdcId: number
-  ): Promise<{ food?: FoodItem; log?: MCPCallLog; error?: string }> {
-    const getTool = this.findTool(['usda_get_food', 'get_food', 'getFood']) || 'usda_get_food';
-
-    const invokeRes = await this.mcpClient.invokeTool<any>(getTool, { fdcId });
-    if (!invokeRes.success || !invokeRes.result) {
-      return { log: invokeRes.log, error: invokeRes.error };
-    }
-
-    return { food: this.normalizeUSDAFood(invokeRes.result), log: invokeRes.log };
-  }
-
-  /**
-   * Compare foods via USDA MCP
-   */
-  public async compareFoods(
-    fdcIds: number[]
-  ): Promise<{ foods: FoodItem[]; log?: MCPCallLog; error?: string }> {
-    const compareTool = this.findTool(['usda_compare_foods', 'compare_foods', 'compareFoods']) || 'usda_compare_foods';
-
-    const invokeRes = await this.mcpClient.invokeTool<any>(compareTool, {
-      fdcIds: fdcIds.join(',')
-    });
-
-    if (!invokeRes.success || !invokeRes.result) {
-      return { foods: [], log: invokeRes.log, error: invokeRes.error };
-    }
-
-    const rawFoods = invokeRes.result.foods || [];
-    return {
-      foods: rawFoods.map((f: any) => this.normalizeUSDAFood(f)),
-      log: invokeRes.log
-    };
-  }
-
-  /**
-   * Normalizes USDA raw food record into shared TypeScript FoodItem.
-   * NOTE: Missing nutrient values remain undefined. NEVER converted to zero!
-   */
-  private normalizeUSDAFood(raw: any): FoodItem {
-    const nutrients = raw.foodNutrients || [];
-
-    const getNutrientVal = (names: string[]): number | undefined => {
-      const match = nutrients.find((n: any) => {
-        const name = (n.nutrientName || n.name || '').toLowerCase();
-        return names.some(target => name.includes(target.toLowerCase()));
-      });
-      return match && match.value !== undefined ? Number(match.value) : undefined;
-    };
-
-    const calories = getNutrientVal(['Energy']) ?? 0;
-    const proteinGrams = getNutrientVal(['Protein']) ?? 0;
-    const fatGrams = getNutrientVal(['Total lipid', 'fat']) ?? 0;
-    const carbohydrateGrams = getNutrientVal(['Carbohydrate', 'carb']) ?? 0;
-    const fibreGrams = getNutrientVal(['Fiber', 'fibre']);
-    const sodiumMg = getNutrientVal(['Sodium', 'Na']);
-    const potassiumMg = getNutrientVal(['Potassium', 'K']);
-    const calciumMg = getNutrientVal(['Calcium', 'Ca']);
-    const ironMg = getNutrientVal(['Iron', 'Fe']);
-
-    const fdcId = String(raw.fdcId || raw.id || 'USDA');
-
-    return {
-      foodId: `USDA-${fdcId}`,
-      name: raw.description || 'USDA Food Item',
-      description: `USDA FoodData Central item (${raw.dataType || 'Foundation'}). Note: international nutrition profile.`,
-      category: 'ingredient',
-      servingSize: {
-        amount: Number(raw.servingSize) || 100,
-        unit: raw.servingSizeUnit || 'g',
-        description: `100g standard reference portion`
-      },
-      calories,
-      proteinGrams,
-      carbohydrateGrams,
-      fatGrams,
-      fibreGrams,
-      sodiumMg,
-      micronutrients: {
-        potassiumMg,
-        calciumMg,
-        ironMg
-      },
-      source: 'USDA FoodData Central',
-      sourceId: fdcId,
-      sourceUrl: `https://fdc.nal.usda.gov/fdc-app.html#/food-details/${fdcId}/nutrients`,
-      matchType: 'approximate',
-      confidence: 'medium',
-      provenanceNotes: 'Retrieved via USDA FoodData Central MCP fallback.'
-    };
+  async getFood(fdcId: number) { const tool = this.findTool(['get_food', 'food_get', 'usda_get_food', 'getFood']); if (!tool) return { error: 'Food MCP has no discovered get tool' }; const result = await this.mcpClient.invokeTool<any>(tool, { fdcId, id: fdcId }); return result.success ? { food: this.normalize(result.result), log: result.log } : { log: result.log, error: result.error }; }
+  async compareFoods(fdcIds: number[]) { const tool = this.findTool(['compare_foods', 'usda_compare_foods', 'compareFoods']); if (!tool) return { foods: [], error: 'Food MCP has no discovered comparison tool' }; const result = await this.mcpClient.invokeTool<any>(tool, { fdcIds: fdcIds.join(','), ids: fdcIds }); const raw = result.result?.foods || []; return { foods: result.success ? raw.map((item: any) => this.normalize(item)).filter(Boolean) as FoodItem[] : [], log: result.log, error: result.error }; }
+  private normalize(raw: any): FoodItem | undefined {
+    if (!raw || typeof raw !== 'object') return undefined;
+    const nutrients = Array.isArray(raw.foodNutrients) ? raw.foodNutrients : Array.isArray(raw.nutrients) ? raw.nutrients : [];
+    const value = (terms: string[]) => { const n = nutrients.find((item: any) => terms.some(term => String(item.nutrientName || item.name || item.nutrient?.name || '').toLowerCase().includes(term))); const v = n?.value ?? n?.amount; return v === undefined || v === null || Number.isNaN(Number(v)) ? undefined : Number(v); };
+    const calories = value(['energy', 'calorie']), protein = value(['protein']), carbs = value(['carbohydrate', 'carb']), fat = value(['total lipid', 'fat']);
+    if ([calories, protein, carbs, fat].some(v => v === undefined)) return undefined;
+    const id = String(raw.fdcId || raw.id || raw.foodId || ''); if (!id) return undefined;
+    return { foodId: `FOOD-${id}`, name: String(raw.description || raw.name || 'Food'), description: String(raw.description || raw.name || 'Remote food composition record'), category: 'ingredient', servingSize: { amount: Number(raw.servingSize) || 100, unit: raw.servingSizeUnit || 'g' }, calories, proteinGrams: protein, carbohydrateGrams: carbs, fatGrams: fat, fibreGrams: value(['fiber', 'fibre']), sodiumMg: value(['sodium']), micronutrients: { potassiumMg: value(['potassium']), calciumMg: value(['calcium']), ironMg: value(['iron']) }, source: 'USDA FoodData Central', sourceId: id, sourceUrl: `https://fdc.nal.usda.gov/fdc-app.html#/food-details/${id}/nutrients`, matchType: 'approximate', confidence: 'medium', provenanceNotes: 'Retrieved from a configured remote Food MCP.' };
   }
 }

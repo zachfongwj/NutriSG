@@ -1,307 +1,122 @@
-import {
-  JsonRpcRequest,
-  JsonRpcResponse,
-  MCPToolDefinition,
-  MCPInitializeResult,
-  MCPToolsListResult,
-  MCPToolCallResult,
-  MCPServerConnectionConfig
-} from './types';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { MCPCallLog } from '../types/orchestration';
 
-export interface MCPHandler {
-  handleRequest(req: JsonRpcRequest): Promise<JsonRpcResponse>;
+export type MCPStatus = 'connected' | 'not_configured' | 'connection_failed' | 'initialization_failed' | 'tool_discovery_failed';
+
+export interface MCPServerConnectionConfig {
+  serverId: string;
+  serverName: string;
+  endpointUrl?: string;
+}
+
+export interface MCPStatusReport {
+  id: string;
+  name: string;
+  configured: boolean;
+  connected: boolean;
+  status: MCPStatus;
+  toolsDiscovered: number;
+  toolNames: string[];
+  serverInfo?: { name?: string; version?: string };
+  transport: 'streamable_http' | 'not_configured';
+  lastError?: string;
+  lastCheckTime: string;
 }
 
 export class MCPClient {
-  private serverConfig: MCPServerConnectionConfig;
-  private isInitialized = false;
-  private discoveredTools: MCPToolDefinition[] = [];
-  private serverInfo?: { name: string; version: string };
-  private inProcessHandler?: MCPHandler;
-  private requestIdCounter = 1;
+  private client?: Client;
+  private transport?: StreamableHTTPClientTransport;
+  private discoveredTools: Array<{ name: string; description?: string; inputSchema?: unknown }> = [];
+  private serverInfo?: { name?: string; version?: string };
+  private status: MCPStatus;
+  private lastError?: string;
+  private connecting?: Promise<void>;
 
-  constructor(config: MCPServerConnectionConfig, inProcessHandler?: MCPHandler) {
-    this.serverConfig = config;
-    this.inProcessHandler = inProcessHandler;
+  constructor(private readonly config: MCPServerConnectionConfig) {
+    this.status = config.endpointUrl ? 'connection_failed' : 'not_configured';
   }
 
-  public getServerConfig(): MCPServerConnectionConfig {
-    return this.serverConfig;
+  getServerConfig(): MCPServerConnectionConfig { return this.config; }
+  getDiscoveredTools() { return [...this.discoveredTools]; }
+  getServerInfo() { return this.serverInfo; }
+  isConnected() { return this.status === 'connected'; }
+  getStatus() { return this.status; }
+  getLastError() { return this.lastError; }
+
+  async connect(): Promise<{ success: boolean; toolsCount: number; error?: string }> {
+    if (!this.config.endpointUrl) {
+      this.status = 'not_configured';
+      return { success: false, toolsCount: 0, error: 'MCP endpoint is not configured' };
+    }
+    if (this.isConnected()) return { success: true, toolsCount: this.discoveredTools.length };
+    if (this.connecting) {
+      await this.connecting;
+      return { success: this.isConnected(), toolsCount: this.discoveredTools.length, error: this.lastError };
+    }
+
+    this.connecting = this.connectRemote();
+    try { await this.connecting; } finally { this.connecting = undefined; }
+    return { success: this.isConnected(), toolsCount: this.discoveredTools.length, error: this.lastError };
   }
 
-  public getDiscoveredTools(): MCPToolDefinition[] {
-    return [...this.discoveredTools];
-  }
-
-  public getServerInfo() {
-    return this.serverInfo;
-  }
-
-  public isConnected(): boolean {
-    return this.isInitialized;
-  }
-
-  /**
-   * Connect and initialize MCP session with the server
-   */
-  public async connect(): Promise<{ success: boolean; toolsCount: number; error?: string }> {
+  private async connectRemote(): Promise<void> {
+    this.status = 'connection_failed';
+    this.lastError = undefined;
+    this.discoveredTools = [];
     try {
-      const initReq: JsonRpcRequest = {
-        jsonrpc: '2.0',
-        id: this.requestIdCounter++,
-        method: 'initialize',
-        params: {
-          protocolVersion: '2024-11-05',
-          capabilities: {
-            tools: {}
-          },
-          clientInfo: {
-            name: 'NutriSG-MCP-Client',
-            version: '1.0.0'
-          }
-        }
-      };
-
-      const initRes = await this.sendJsonRpc<MCPInitializeResult>(initReq);
-      if (initRes.error) {
-        return { success: false, toolsCount: 0, error: initRes.error.message };
-      }
-
-      this.serverInfo = initRes.result?.serverInfo;
-
-      // Send initialized notification
-      await this.sendNotification({
-        jsonrpc: '2.0',
-        id: this.requestIdCounter++,
-        method: 'notifications/initialized'
-      });
-
-      // Discover tools
-      const listToolsReq: JsonRpcRequest = {
-        jsonrpc: '2.0',
-        id: this.requestIdCounter++,
-        method: 'tools/list',
-        params: {}
-      };
-
-      const toolsRes = await this.sendJsonRpc<MCPToolsListResult>(listToolsReq);
-      if (toolsRes.error) {
-        return { success: false, toolsCount: 0, error: toolsRes.error.message };
-      }
-
-      this.discoveredTools = toolsRes.result?.tools || [];
-      this.isInitialized = true;
-
-      return {
-        success: true,
-        toolsCount: this.discoveredTools.length
-      };
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.isInitialized = false;
-      return { success: false, toolsCount: 0, error: msg };
-    }
-  }
-
-  /**
-   * Invokes an MCP tool with validation, response timing and call logging
-   */
-  public async invokeTool<T = unknown>(
-    toolName: string,
-    args: Record<string, unknown>
-  ): Promise<{
-    success: boolean;
-    result?: T;
-    rawContent?: string;
-    log: MCPCallLog;
-    error?: string;
-  }> {
-    const startTime = Date.now();
-    const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-
-    // Sanitize arguments to avoid logging sensitive data
-    const sanitizedArgs = { ...args };
-    for (const key of Object.keys(sanitizedArgs)) {
-      if (/key|secret|token|password|auth/i.test(key)) {
-        sanitizedArgs[key] = '***REDACTED***';
-      }
-    }
-
-    if (!this.isInitialized) {
-      const connectResult = await this.connect();
-      if (!connectResult.success) {
-        const duration = Date.now() - startTime;
-        const log: MCPCallLog = {
-          id: callId,
-          timestamp: new Date().toISOString(),
-          server: this.serverConfig.serverName as any,
-          toolName,
-          sanitizedArguments: sanitizedArgs,
-          status: 'failure',
-          responseTimeMs: duration,
-          resultSummary: 'Failed to initialize MCP connection',
-          error: connectResult.error
-        };
-        return { success: false, log, error: connectResult.error };
-      }
-    }
-
-    // Verify tool exists in discovered tools
-    const toolExists = this.discoveredTools.find(t => t.name === toolName);
-    if (!toolExists) {
-      // Find candidate similar tool or warn
-      const available = this.discoveredTools.map(t => t.name).join(', ');
-      const duration = Date.now() - startTime;
-      const log: MCPCallLog = {
-        id: callId,
-        timestamp: new Date().toISOString(),
-        server: this.serverConfig.serverName as any,
-        toolName,
-        sanitizedArguments: sanitizedArgs,
-        status: 'failure',
-        responseTimeMs: duration,
-        resultSummary: `Tool '${toolName}' not found among discovered tools (${available || 'none'})`,
-        error: `Tool '${toolName}' not found`
-      };
-      return {
-        success: false,
-        log,
-        error: `Tool '${toolName}' not discovered on server '${this.serverConfig.serverName}'`
-      };
-    }
-
-    try {
-      const toolCallReq: JsonRpcRequest = {
-        jsonrpc: '2.0',
-        id: this.requestIdCounter++,
-        method: 'tools/call',
-        params: {
-          name: toolName,
-          arguments: args
-        }
-      };
-
-      const res = await this.sendJsonRpc<MCPToolCallResult>(toolCallReq);
-      const duration = Date.now() - startTime;
-
-      if (res.error) {
-        const log: MCPCallLog = {
-          id: callId,
-          timestamp: new Date().toISOString(),
-          server: this.serverConfig.serverName as any,
-          toolName,
-          sanitizedArguments: sanitizedArgs,
-          status: 'failure',
-          responseTimeMs: duration,
-          resultSummary: `JSON-RPC Error: ${res.error.message}`,
-          error: res.error.message
-        };
-        return { success: false, log, error: res.error.message };
-      }
-
-      if (res.result?.isError) {
-        const text = res.result.content?.map(c => c.text).join('\n') || 'Unknown tool error';
-        const log: MCPCallLog = {
-          id: callId,
-          timestamp: new Date().toISOString(),
-          server: this.serverConfig.serverName as any,
-          toolName,
-          sanitizedArguments: sanitizedArgs,
-          status: 'failure',
-          responseTimeMs: duration,
-          resultSummary: text.substring(0, 100),
-          error: text
-        };
-        return { success: false, log, error: text };
-      }
-
-      const textOutput = res.result?.content?.map(c => c.text).join('\n') || '';
-      let parsedData: T | undefined;
+      this.client = new Client({ name: 'NutriSG', version: '1.0.0' }, { capabilities: { tools: {} } });
+      this.transport = new StreamableHTTPClientTransport(new URL(this.config.endpointUrl!));
       try {
-        if (textOutput) {
-          parsedData = JSON.parse(textOutput) as T;
-        }
-      } catch {
-        // If not JSON, leave as raw string
-        parsedData = textOutput as unknown as T;
+        await this.client.connect(this.transport);
+      } catch (error) {
+        this.status = 'initialization_failed';
+        throw error;
       }
-
-      const summary = textOutput.length > 120 ? `${textOutput.substring(0, 117)}...` : textOutput;
-      const log: MCPCallLog = {
-        id: callId,
-        timestamp: new Date().toISOString(),
-        server: this.serverConfig.serverName as any,
-        toolName,
-        sanitizedArguments: sanitizedArgs,
-        status: 'success',
-        responseTimeMs: duration,
-        resultSummary: summary || 'Tool call completed successfully'
-      };
-
-      return {
-        success: true,
-        result: parsedData,
-        rawContent: textOutput,
-        log
-      };
-    } catch (err: unknown) {
-      const duration = Date.now() - startTime;
-      const msg = err instanceof Error ? err.message : String(err);
-      const log: MCPCallLog = {
-        id: callId,
-        timestamp: new Date().toISOString(),
-        server: this.serverConfig.serverName as any,
-        toolName,
-        sanitizedArguments: sanitizedArgs,
-        status: 'failure',
-        responseTimeMs: duration,
-        resultSummary: `Network/Protocol error: ${msg}`,
-        error: msg
-      };
-      return { success: false, log, error: msg };
+      let listed;
+      try {
+        listed = await this.client.listTools();
+      } catch (error) {
+        this.status = 'tool_discovery_failed';
+        throw error;
+      }
+      this.discoveredTools = listed.tools || [];
+      this.serverInfo = this.client.getServerVersion() || undefined;
+      this.status = 'connected';
+    } catch (error) {
+      this.lastError = this.safeError(error);
+      if (this.status === 'connection_failed') this.status = 'connection_failed';
+      await this.closeQuietly();
     }
   }
 
-  private async sendJsonRpc<T>(req: JsonRpcRequest): Promise<JsonRpcResponse<T>> {
-    if (this.serverConfig.transport === 'in_process' && this.inProcessHandler) {
-      return (await this.inProcessHandler.handleRequest(req)) as JsonRpcResponse<T>;
+  async invokeTool<T = unknown>(toolName: string, args: Record<string, unknown>): Promise<{ success: boolean; result?: T; rawContent?: string; log: MCPCallLog; error?: string }> {
+    const started = Date.now();
+    const sanitizedArguments = Object.fromEntries(Object.entries(args).map(([key, value]) => [/key|secret|token|password|auth/i.test(key) ? [key, '***REDACTED***'] : [key, value]]));
+    const base = { id: `call_${Date.now()}`, timestamp: new Date().toISOString(), server: this.config.serverName as MCPCallLog['server'], toolName, sanitizedArguments };
+    const connected = await this.connect();
+    if (!connected.success || !this.client) {
+      return { success: false, error: connected.error || 'MCP connection unavailable', log: { ...base, status: 'failure', responseTimeMs: Date.now() - started, resultSummary: 'MCP connection unavailable', error: connected.error } };
     }
-
-    if (this.serverConfig.transport === 'streamable_http' && this.serverConfig.endpointUrl) {
-      const response = await fetch(this.serverConfig.endpointUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/event-stream'
-        },
-        body: JSON.stringify(req)
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      return data as JsonRpcResponse<T>;
+    if (!this.discoveredTools.some(tool => tool.name === toolName)) {
+      const error = `Tool '${toolName}' was not discovered`;
+      return { success: false, error, log: { ...base, status: 'failure', responseTimeMs: Date.now() - started, resultSummary: error, error } };
     }
-
-    throw new Error(`Unsupported or unconfigured MCP transport: ${this.serverConfig.transport}`);
-  }
-
-  private async sendNotification(req: JsonRpcRequest): Promise<void> {
     try {
-      if (this.serverConfig.transport === 'in_process' && this.inProcessHandler) {
-        await this.inProcessHandler.handleRequest(req);
-      } else if (this.serverConfig.transport === 'streamable_http' && this.serverConfig.endpointUrl) {
-        await fetch(this.serverConfig.endpointUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(req)
-        }).catch(() => {});
-      }
-    } catch {
-      // Notifications do not require response
+      const response = await this.client.callTool({ name: toolName, arguments: args });
+      const content = Array.isArray(response.content) ? response.content : [];
+      const rawContent = content.filter((item: any) => item.type === 'text').map((item: any) => item.text).join('\n');
+      let result: T | undefined;
+      if (response.structuredContent !== undefined) result = response.structuredContent as T;
+      else if (rawContent) { try { result = JSON.parse(rawContent) as T; } catch { result = rawContent as T; } }
+      if ((response as any).isError) throw new Error(rawContent || 'Remote MCP tool returned an error');
+      return { success: true, result, rawContent, log: { ...base, status: 'success', responseTimeMs: Date.now() - started, resultSummary: rawContent.slice(0, 120) || 'Tool call completed' } };
+    } catch (error) {
+      const message = this.safeError(error);
+      return { success: false, error: message, log: { ...base, status: 'failure', responseTimeMs: Date.now() - started, resultSummary: 'Remote MCP tool call failed', error: message } };
     }
   }
+
+  private safeError(error: unknown) { return error instanceof Error ? error.message.replace(/https?:\/\/[^\s]+/g, '[endpoint]') : 'Unknown MCP error'; }
+  private async closeQuietly() { try { await this.transport?.close(); } catch { /* best effort */ } this.client = undefined; this.transport = undefined; }
 }

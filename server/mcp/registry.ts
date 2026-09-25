@@ -1,113 +1,30 @@
-import { MCPClient } from './client';
-import { USDAMcpServer } from './servers/usdaMcpServer';
-import { PubMedMcpServer } from './servers/pubmedMcpServer';
-import { GarminMcpServer } from './servers/garminMcpServer';
-
-export interface MCPServerStatusReport {
-  id: string;
-  name: string;
-  category: 'Food Data' | 'Evidence' | 'Fitness';
-  status: 'connected' | 'disconnected' | 'not_configured';
-  transport: string;
-  toolsDiscoveredCount: number;
-  toolNames: string[];
-  serverInfo?: { name: string; version: string };
-  lastCheckTime: string;
-  error?: string;
-}
+import { MCPClient, MCPStatusReport } from './client';
 
 export class MCPRegistry {
   private static instance: MCPRegistry;
-
-  private usdaClient: MCPClient;
-  private pubmedClient: MCPClient;
-  private garminClient: MCPClient;
-
+  private readonly clients: Record<'food' | 'pubmed' | 'garmin', MCPClient>;
   private constructor() {
-    // Initialize in-process standard MCP servers
-    const usdaServer = new USDAMcpServer();
-    const pubmedServer = new PubMedMcpServer();
-    const garminServer = new GarminMcpServer();
-
-    this.usdaClient = new MCPClient(
-      {
-        serverId: 'usda-fooddata-mcp',
-        serverName: 'USDA FoodData Central MCP',
-        transport: 'in_process'
-      },
-      usdaServer
-    );
-
-    this.pubmedClient = new MCPClient(
-      {
-        serverId: 'pubmed-mcp',
-        serverName: 'PubMed MCP',
-        transport: 'in_process'
-      },
-      pubmedServer
-    );
-
-    this.garminClient = new MCPClient(
-      {
-        serverId: 'garmin-connect-mcp',
-        serverName: 'Garmin Connect MCP',
-        transport: 'in_process'
-      },
-      garminServer
-    );
+    const foodUrl = process.env.FOOD_MCP_URL || process.env.USDA_MCP_URL;
+    this.clients = {
+      food: new MCPClient({ serverId: 'food-mcp', serverName: 'Food MCP', endpointUrl: foodUrl }),
+      pubmed: new MCPClient({ serverId: 'pubmed-mcp', serverName: 'PubMed MCP', endpointUrl: process.env.PUBMED_MCP_URL }),
+      garmin: new MCPClient({ serverId: 'garmin-connect-mcp', serverName: 'Garmin Connect MCP', endpointUrl: process.env.GARMIN_MCP_URL })
+    };
   }
-
-  public static getInstance(): MCPRegistry {
-    if (!MCPRegistry.instance) {
-      MCPRegistry.instance = new MCPRegistry();
-    }
-    return MCPRegistry.instance;
-  }
-
-  public getUsdaClient(): MCPClient {
-    return this.usdaClient;
-  }
-
-  public getPubmedClient(): MCPClient {
-    return this.pubmedClient;
-  }
-
-  public getGarminClient(): MCPClient {
-    return this.garminClient;
-  }
-
-  public async getStatusReports(): Promise<MCPServerStatusReport[]> {
-    // Ensure all clients have connected & discovered tools
-    const clients = [
-      { client: this.usdaClient, category: 'Food Data' as const },
-      { client: this.pubmedClient, category: 'Evidence' as const },
-      { client: this.garminClient, category: 'Fitness' as const }
-    ];
-
-    const reports: MCPServerStatusReport[] = [];
-
-    for (const { client, category } of clients) {
+  static getInstance() { return this.instance || (this.instance = new MCPRegistry()); }
+  getFoodClient() { return this.clients.food; }
+  getUsdaClient() { return this.clients.food; }
+  getPubmedClient() { return this.clients.pubmed; }
+  getGarminClient() { return this.clients.garmin; }
+  async getStatusReports(): Promise<MCPStatusReport[]> {
+    return Promise.all(Object.values(this.clients).map(async client => {
+      await client.connect();
       const config = client.getServerConfig();
-      if (!client.isConnected()) {
-        await client.connect();
-      }
-
-      const tools = client.getDiscoveredTools();
-      const connected = client.isConnected();
-
-      reports.push({
-        id: config.serverId,
-        name: config.serverName,
-        category,
-        status: connected ? 'connected' : 'disconnected',
-        transport: config.transport,
-        toolsDiscoveredCount: tools.length,
-        toolNames: tools.map(t => t.name),
-        serverInfo: client.getServerInfo(),
-        lastCheckTime: new Date().toISOString()
-      });
-    }
-
-    return reports;
+      return { id: config.serverId, name: config.serverName, configured: Boolean(config.endpointUrl), connected: client.isConnected(), status: client.getStatus(), toolsDiscovered: client.getDiscoveredTools().length, toolNames: client.getDiscoveredTools().map(tool => tool.name), serverInfo: client.getServerInfo(), transport: config.endpointUrl ? 'streamable_http' : 'not_configured', lastError: client.getLastError(), lastCheckTime: new Date().toISOString() };
+    }));
+  }
+  async getHealth() {
+    const reports = await this.getStatusReports();
+    return { mcp: Object.fromEntries(reports.map(report => [report.id === 'food-mcp' ? 'food' : report.id === 'pubmed-mcp' ? 'pubmed' : 'garmin', { configured: report.configured, connected: report.connected, status: report.status, toolsDiscovered: report.toolsDiscovered, ...(report.lastError ? { lastError: report.lastError } : {}) }])) };
   }
 }
