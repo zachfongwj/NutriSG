@@ -1,0 +1,5 @@
+bun.lock
+bun.lockb
+node_modules
+.next
+ dist
