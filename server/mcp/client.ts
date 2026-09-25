@@ -1,5 +1,5 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import type { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { MCPCallLog } from '../types/orchestration';
 
 export type MCPStatus = 'connected' | 'not_configured' | 'connection_failed' | 'initialization_failed' | 'tool_discovery_failed';
@@ -37,7 +37,7 @@ export class MCPClient {
     this.status = config.endpointUrl ? 'connection_failed' : 'not_configured';
   }
 
-  getServerConfig(): MCPServerConnectionConfig { return this.config; }
+  getServerConfig() { return this.config; }
   getDiscoveredTools() { return [...this.discoveredTools]; }
   getServerInfo() { return this.serverInfo; }
   isConnected() { return this.status === 'connected'; }
@@ -51,12 +51,15 @@ export class MCPClient {
     }
     if (this.isConnected()) return { success: true, toolsCount: this.discoveredTools.length };
     if (this.connecting) {
-      await this.connecting;
+      try { await this.connecting; } catch { /* connectRemote records the failure */ }
       return { success: this.isConnected(), toolsCount: this.discoveredTools.length, error: this.lastError };
     }
 
     this.connecting = this.connectRemote();
-    try { await this.connecting; } finally { this.connecting = undefined; }
+    try { await this.connecting; } catch (error) {
+      this.status = 'connection_failed';
+      this.lastError = this.safeError(error);
+    } finally { this.connecting = undefined; }
     return { success: this.isConnected(), toolsCount: this.discoveredTools.length, error: this.lastError };
   }
 
@@ -65,6 +68,11 @@ export class MCPClient {
     this.lastError = undefined;
     this.discoveredTools = [];
     try {
+      // Keep the SDK out of module evaluation. This makes importing a health route safe.
+      const [{ Client }, { StreamableHTTPClientTransport }] = await Promise.all([
+        import('@modelcontextprotocol/sdk/client/index.js'),
+        import('@modelcontextprotocol/sdk/client/streamableHttp.js')
+      ]);
       this.client = new Client({ name: 'NutriSG', version: '1.0.0' }, { capabilities: { tools: {} } });
       this.transport = new StreamableHTTPClientTransport(new URL(this.config.endpointUrl!));
       try {
@@ -73,19 +81,17 @@ export class MCPClient {
         this.status = 'initialization_failed';
         throw error;
       }
-      let listed;
       try {
-        listed = await this.client.listTools();
+        const listed = await this.client.listTools();
+        this.discoveredTools = listed.tools || [];
       } catch (error) {
         this.status = 'tool_discovery_failed';
         throw error;
       }
-      this.discoveredTools = listed.tools || [];
       this.serverInfo = this.client.getServerVersion() || undefined;
       this.status = 'connected';
     } catch (error) {
       this.lastError = this.safeError(error);
-      if (this.status === 'connection_failed') this.status = 'connection_failed';
       await this.closeQuietly();
     }
   }
@@ -95,9 +101,7 @@ export class MCPClient {
     const sanitizedArguments = Object.fromEntries(Object.entries(args).map(([key, value]) => [/key|secret|token|password|auth/i.test(key) ? [key, '***REDACTED***'] : [key, value]]));
     const base = { id: `call_${Date.now()}`, timestamp: new Date().toISOString(), server: this.config.serverName as MCPCallLog['server'], toolName, sanitizedArguments };
     const connected = await this.connect();
-    if (!connected.success || !this.client) {
-      return { success: false, error: connected.error || 'MCP connection unavailable', log: { ...base, status: 'failure', responseTimeMs: Date.now() - started, resultSummary: 'MCP connection unavailable', error: connected.error } };
-    }
+    if (!connected.success || !this.client) return { success: false, error: connected.error || 'MCP connection unavailable', log: { ...base, status: 'failure', responseTimeMs: Date.now() - started, resultSummary: 'MCP connection unavailable', error: connected.error } };
     if (!this.discoveredTools.some(tool => tool.name === toolName)) {
       const error = `Tool '${toolName}' was not discovered`;
       return { success: false, error, log: { ...base, status: 'failure', responseTimeMs: Date.now() - started, resultSummary: error, error } };
@@ -117,6 +121,9 @@ export class MCPClient {
     }
   }
 
-  private safeError(error: unknown) { return error instanceof Error ? error.message.replace(/https?:\/\/[^\s]+/g, '[endpoint]') : 'Unknown MCP error'; }
+  private safeError(error: unknown) {
+    const message = error instanceof Error ? error.message : 'Unknown MCP error';
+    return message.replace(/https?:\/\/[^\s]+/g, '[endpoint]').slice(0, 240);
+  }
   private async closeQuietly() { try { await this.transport?.close(); } catch { /* best effort */ } this.client = undefined; this.transport = undefined; }
 }
